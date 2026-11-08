@@ -1,12 +1,15 @@
 """Entrenamiento de inpainting para accuracy de tokens DINOv3-VQ. Pensado para Kaggle:
 presupuesto de tiempo (--time-budget-h), LR dependiente del tiempo, checkpoints atómicos y reanudación."""
 import argparse, copy, math, os, time
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from PIL import Image
 
 from common import DinoVQ, UNet, random_masks, up_mask
@@ -31,9 +34,29 @@ ap.add_argument("--w-cos", type=float, default=2.0)
 ap.add_argument("--w-ce", type=float, default=0.5)
 ap.add_argument("--resume", default="")
 ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--channels-last", type=int, default=0, help="1 = U-Net en channels_last (probar si acelera)")
+ap.add_argument("--gt-bs", type=int, default=64, help="batch para precomputar embeddings GT")
 a = ap.parse_args()
 
-dev = "cuda"
+# ------------------------------------------------------------------ multi-GPU (torchrun) o 1 GPU (python)
+# --bs es POR GPU: batch efectivo = bs * world.
+rank, world, local = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1)), int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local)
+if world > 1:
+    dist.init_process_group("nccl", timeout=timedelta(minutes=60))
+dev = f"cuda:{local}"
+
+
+def barrier():
+    if world > 1:
+        dist.barrier()
+
+
+def P(*args, **kw):
+    if rank == 0:
+        print(*args, **kw, flush=True)
+
+
 torch.manual_seed(a.seed); np.random.seed(a.seed)
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -45,7 +68,7 @@ def load_train():
     if a.cache and Path(a.cache).exists():
         return np.load(a.cache, mmap_mode="r")
     files = sorted(p for p in Path(a.train_dir).rglob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg"})
-    print(len(files), "imágenes de train", flush=True)
+    P(len(files), "imágenes de train")
 
     def rd(p):
         im = Image.open(p).convert("RGB")
@@ -59,27 +82,41 @@ def load_train():
     return arr
 
 
-data = load_train()
+if rank == 0:                     # rank 0 crea la caché .npy, el resto la lee
+    data = load_train()
+barrier()
+if rank != 0:
+    data = load_train()
 N = len(data)
 perm = np.random.default_rng(1234).permutation(N)          # split fijo independiente de --seed
 val_idx, tr_idx = np.sort(perm[:a.val_n]), perm[a.val_n:]
 val_imgs = torch.from_numpy(np.ascontiguousarray(data[val_idx]))
-print(f"train={len(tr_idx)} val={len(val_idx)}", flush=True)
+P(f"train={len(tr_idx)} val={len(val_idx)} | GPUs={world} bs/GPU={a.bs} bs efectivo={a.bs * world}")
 
 # ------------------------------------------------------------------ modelos
-dino = DinoVQ(a.codebook, dev)
+if rank == 0:                     # rank 0 descarga/carga primero (evita descargas simultáneas)
+    dino = DinoVQ(a.codebook, dev)
+barrier()
+if rank != 0:
+    dino = DinoVQ(a.codebook, dev)
+torch.manual_seed(a.seed)         # misma init de la U-Net en todos los ranks (y por tanto del EMA)
 net = UNet().to(dev)
+if a.channels_last:
+    net = net.to(memory_format=torch.channels_last)
+torch.manual_seed(a.seed + rank)  # máscaras/flips distintos por rank
 ema = copy.deepcopy(net).eval().requires_grad_(False)
 opt = torch.optim.AdamW(net.parameters(), lr=a.lr, betas=(0.9, 0.99), weight_decay=0.01)
 scaler = torch.amp.GradScaler("cuda")
 step, elapsed = 0, 0.0
-print("parámetros U-Net: %.1fM" % (sum(p.numel() for p in net.parameters()) / 1e6), flush=True)
+P("parámetros U-Net: %.1fM" % (sum(p.numel() for p in net.parameters()) / 1e6))
 
 if a.resume and Path(a.resume).exists():
     ck = torch.load(a.resume, map_location=dev)
     net.load_state_dict(ck["model"]); ema.load_state_dict(ck["ema"]); opt.load_state_dict(ck["opt"])
     scaler.load_state_dict(ck["scaler"]); step, elapsed = ck["step"], ck["elapsed"]
-    print(f"reanudado: step={step} tiempo previo={elapsed/3600:.2f}h", flush=True)
+    P(f"reanudado: step={step} tiempo previo={elapsed/3600:.2f}h")
+
+net_fwd = DDP(net, device_ids=[local]) if world > 1 else net
 
 
 def save(path):
@@ -106,27 +143,63 @@ def validate(model, black_baseline=False):
     return hit / tot
 
 
-base = validate(None, True)
-print(f"baseline parche negro: VAL acc={base:.4f}", flush=True)
+base = validate(None, True) if rank == 0 else 0.0
+P(f"baseline parche negro: VAL acc={base:.4f}")
+
+
+# ------------------------------------------------------------------ embeddings GT precomputados (no dependen de la máscara)
+@torch.no_grad()
+def build_gt():
+    """(N,2,64,D) fp16: embedding DINO de cada imagen sin flip / con flip. Se reparte entre GPUs y se cachea en disco."""
+    path = Path(a.cache + ".gt.npy") if a.cache else out / "gt.npy"
+    done = Path(str(path) + ".done")
+    if not done.exists():
+        D = dino.codebook.shape[1]
+        if rank == 0:
+            mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float16, shape=(N, 2, 64, D)); del mm
+        barrier()
+        mm = np.load(path, mmap_mode="r+")
+        t = time.time()
+        for s in range(rank * a.gt_bs, N, world * a.gt_bs):
+            e = min(s + a.gt_bs, N)
+            img = torch.from_numpy(np.ascontiguousarray(data[s:e])).to(dev).permute(0, 3, 1, 2).float() / 255
+            with torch.autocast("cuda", torch.float16):
+                e0, e1 = dino.embed(img), dino.embed(img.flip(-1))
+            mm[s:e, 0] = e0.half().cpu().numpy(); mm[s:e, 1] = e1.half().cpu().numpy()
+        mm.flush(); del mm
+        barrier()
+        if rank == 0:
+            done.touch()
+        barrier()
+        P(f"embeddings GT precomputados en {time.time() - t:.0f}s -> {path}")
+    return np.load(path, mmap_mode="r")
+
+
+gt_all = build_gt()
 
 # ------------------------------------------------------------------ entrenamiento
 budget = a.time_budget_h * 3600
 ema_params, net_params = list(ema.parameters()), list(net.parameters())
 tr_t = torch.from_numpy(np.ascontiguousarray(data[tr_idx]))   # ~3 GB en RAM
-order, ptr = np.random.default_rng(a.seed + step).permutation(len(tr_idx)), 0
+order, ptr = np.random.default_rng(a.seed + step).permutation(len(tr_idx))[rank::world], 0   # shards disjuntos por rank
 t0 = time.time() - elapsed
 last_save = time.time(); run = {"loss": 0, "pix": 0, "cos": 0, "ce": 0, "n": 0}
+t_log, s_log = time.time(), step
 net.train()
 
 while True:
-    elapsed = time.time() - t0
+    tt = torch.tensor([time.time() - t0], device=dev, dtype=torch.float64)
+    if world > 1:
+        dist.broadcast(tt, 0)         # todos los ranks usan el mismo reloj (corte y LR sincronizados)
+    elapsed = tt.item()
     if elapsed >= budget or (a.max_steps and step >= a.max_steps):
         break
     if ptr + a.bs > len(order):
-        order, ptr = np.random.default_rng(a.seed + step).permutation(len(tr_idx)), 0
+        order, ptr = np.random.default_rng(a.seed + step).permutation(len(tr_idx))[rank::world], 0
     idx = torch.from_numpy(order[ptr:ptr + a.bs]); ptr += a.bs
     img = tr_t[idx].to(dev, non_blocking=True).permute(0, 3, 1, 2).float() / 255
-    fh = torch.rand(len(img), device=dev) < 0.5
+    fh_c = torch.rand(len(img)) < 0.5
+    fh = fh_c.to(dev)
     img = torch.where(fh[:, None, None, None], img.flip(-1), img)           # flip horizontal aleatorio
     m8 = random_masks(len(img), dev); m = up_mask(m8); mt = m8.view(len(img), 64)
 
@@ -134,12 +207,11 @@ while True:
     for gp in opt.param_groups:
         gp["lr"] = lr
 
+    e_gt = torch.from_numpy(gt_all[tr_idx[idx.numpy()], fh_c.numpy().astype(np.int64)]).to(dev).float()   # GT precomputado
+    tgt = (e_gt @ dino.codebook.T).argmax(-1)
     with torch.autocast("cuda", torch.float16):
-        pred = net(img, m)
+        pred = net_fwd(img, m)
         e = dino.embed(pred)
-        with torch.no_grad():
-            e_gt = dino.embed(img)
-            tgt = (e_gt @ dino.codebook.T).argmax(-1)
     pix = ((pred.float() - img).abs() * m).sum() / (m.sum() * 3).clamp(min=1)
     cos = (1 - (e * e_gt).sum(-1))[mt].mean()
     ce = F.cross_entropy((e @ dino.codebook.T)[mt] / a.tau, tgt[mt])
@@ -159,14 +231,18 @@ while True:
     run["n"] += step % 20 == 0
     if step % 200 == 0 and run["n"]:
         n = run["n"]
-        print(f"step {step} t={elapsed/3600:.2f}h lr={lr:.2e} loss={run['loss']/n:.4f} pix={run['pix']/n:.4f} "
-              f"cos={run['cos']/n:.4f} ce={run['ce']/n:.3f}", flush=True)
-        run = {k: 0 for k in run}
-    if step % a.val_every == 0:
+        P(f"step {step} t={elapsed/3600:.2f}h lr={lr:.2e} loss={run['loss']/n:.4f} pix={run['pix']/n:.4f} "
+          f"cos={run['cos']/n:.4f} ce={run['ce']/n:.3f} | {(step - s_log) / (time.time() - t_log):.2f} it/s")
+        run = {k: 0 for k in run}; t_log, s_log = time.time(), step
+    if step % a.val_every == 0 and rank == 0:
         print(f"== step {step} VAL acc (EMA)={validate(ema):.4f} (baseline negro={base:.4f})", flush=True)
-    if time.time() - last_save > a.save_every_min * 60:
+    if rank == 0 and time.time() - last_save > a.save_every_min * 60:
         save(out / "last.pt"); last_save = time.time()
 
-elapsed = time.time() - t0
-save(out / "last.pt")
-print(f"FIN step={step} t={elapsed/3600:.2f}h | VAL acc (EMA)={validate(ema):.4f} (baseline negro={base:.4f})", flush=True)
+barrier()
+if rank == 0:
+    save(out / "last.pt")
+    print(f"FIN step={step} t={elapsed/3600:.2f}h | VAL acc (EMA)={validate(ema):.4f} (baseline negro={base:.4f})", flush=True)
+barrier()
+if world > 1:
+    dist.destroy_process_group()
